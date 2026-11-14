@@ -1,0 +1,1 @@
+# EdgeIQ Security Scanner Action

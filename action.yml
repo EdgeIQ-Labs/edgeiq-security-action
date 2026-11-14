@@ -1,0 +1,161 @@
+name: 'EdgeIQ Security Scan'
+description: 'Scan repositories for security issues using EdgeIQ Labs scanners. Posts grade badge and findings as PR comments.'
+author: 'EdgeIQ Labs'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  api-key:
+    description: 'EdgeIQ API key (get free key at https://edgeiqlabs.com/developers/)'
+    required: true
+  github-token:
+    description: 'GitHub token for posting PR comments (default: secrets.GITHUB_TOKEN)'
+    required: false
+    default: ${{ github.token }}
+  fail-on-grade:
+    description: 'Fail the check if grade is below this threshold (A, B, C, D, F). Default: never fail'
+    required: false
+    default: ''
+  scan-url:
+    description: 'Repository URL to scan (default: current repo)'
+    required: false
+    default: ''
+
+outputs:
+  grade:
+    description: 'Security grade (A-F)'
+  score:
+    description: 'Security score (0-100)'
+  findings-count:
+    description: 'Number of findings'
+  report-url:
+    description: 'URL to full report on EdgeIQ Labs'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run EdgeIQ Security Scan
+      id: scan
+      shell: bash
+      run: |
+        SCAN_URL="${{ inputs.scan-url }}"
+        if [ -z "$SCAN_URL" ]; then
+          SCAN_URL="https://github.com/${{ github.repository }}"
+        fi
+
+        echo "🔍 Scanning $SCAN_URL via EdgeIQ Labs..."
+
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+          -H "Authorization: Bearer ${{ inputs.api-key }}" \
+          -H "Content-Type: application/json" \
+          -d "{\"url\": \"$SCAN_URL\"}" \
+          https://edgeiqlabs.com/api/v1/repo-scan)
+
+        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+        BODY=$(echo "$RESPONSE" | sed '$d')
+
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "❌ Scan failed with HTTP $HTTP_CODE"
+          echo "$BODY"
+          exit 1
+        fi
+
+        GRADE=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('grade','N/A'))" 2>/dev/null || echo "N/A")
+        SCORE=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('score',0))" 2>/dev/null || echo "0")
+        FINDINGS=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('findings',[])))" 2>/dev/null || echo "0")
+
+        echo "grade=$GRADE" >> $GITHUB_OUTPUT
+        echo "score=$SCORE" >> $GITHUB_OUTPUT
+        echo "findings-count=$FINDINGS" >> $GITHUB_OUTPUT
+        echo "report-url=https://edgeiqlabs.com/free-repo-scanner/?url=$SCAN_URL" >> $GITHUB_OUTPUT
+
+        # Save full response for comment step
+        echo "$BODY" > /tmp/edgeiq-scan-result.json
+
+        echo "✅ Scan complete: Grade $GRADE ($SCORE/100), $FINDINGS findings"
+
+    - name: Post PR Comment
+      if: github.event_name == 'pull_request' && inputs.github-token != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        GRADE="${{ steps.scan.outputs.grade }}"
+        SCORE="${{ steps.scan.outputs.score }}"
+        FINDINGS="${{ steps.scan.outputs.findings-count }}"
+        REPORT_URL="${{ steps.scan.outputs.report-url }}"
+
+        # Grade emoji mapping
+        case $GRADE in
+          A*) EMOJI="🟢" ;;
+          B*) EMOJI="🟡" ;;
+          C*) EMOJI="🟠" ;;
+          *)   EMOJI="🔴" ;;
+        esac
+
+        # Build findings table from JSON
+        FINDINGS_TABLE=$(python3 -c "
+        import json, sys
+        try:
+            with open('/tmp/edgeiq-scan-result.json') as f:
+                data = json.load(f)
+            findings = data.get('findings', [])[:10]
+            if findings:
+                lines = ['| Severity | Finding |', '|----------|---------|']
+                for f in findings:
+                    sev = f.get('severity', f.get('level', 'info')).upper()
+                    desc = f.get('description', f.get('message', f.get('name', 'Unknown')))
+                    lines.append(f'| {sev} | {desc} |')
+                print('\n'.join(lines))
+            else:
+                print('No findings — looking good! 🎉')
+        except:
+            print('Could not parse findings.')
+        " 2>/dev/null)
+
+        COMMENT_BODY="## $EMOJI EdgeIQ Security Scan: **Grade $GRADE** ($SCORE/100)
+
+        $FINDINGS_TABLE
+
+        ---
+        🔗 [View full report →]($REPORT_URL)
+        ⚡ [Get EdgeIQ API Key](https://edgeiqlabs.com/developers/) · 📋 [Compliance Reports](https://edgeiqlabs.com/compliance-report/)
+
+        <sub>Powered by [EdgeIQ Labs](https://edgeiqlabs.com) — Security scanning for developers</sub>"
+
+        # Post or update comment on PR
+        gh pr comment ${{ github.event.pull_request.number }} \
+          --body "$COMMENT_BODY" \
+          --edit-last \
+          --create-if-none 2>/dev/null || \
+        gh pr comment ${{ github.event.pull_request.number }} \
+          --body "$COMMENT_BODY" 2>/dev/null || \
+        echo "⚠️ Could not post PR comment (token may lack permissions)"
+
+    - name: Check Grade Threshold
+      if: inputs.fail-on-grade != ''
+      shell: bash
+      run: |
+        GRADE="${{ steps.scan.outputs.grade }}"
+        THRESHOLD="${{ inputs.fail-on-grade }}"
+
+        # Convert grades to numeric for comparison
+        grade_to_num() {
+          case $1 in
+            A+|A) echo 5 ;; A-) echo 4 ;;
+            B+|B) echo 3 ;; B-) echo 2 ;;
+            C+|C) echo 1 ;; *) echo 0 ;;
+          esac
+        }
+
+        GRADE_NUM=$(grade_to_num "$GRADE")
+        THRESH_NUM=$(grade_to_num "$THRESHOLD")
+
+        if [ "$GRADE_NUM" -lt "$THRESH_NUM" ]; then
+          echo "❌ Grade $GRADE is below threshold $THRESHOLD"
+          exit 1
+        else
+          echo "✅ Grade $GRADE meets threshold $THRESHOLD"
+        fi
